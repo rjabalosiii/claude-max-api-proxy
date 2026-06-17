@@ -95,7 +95,7 @@ async function handleStreamingResponse(
 
   return new Promise<void>((resolve, reject) => {
     let isFirst = true;
-    let lastModel = "claude-sonnet-4";
+    let lastModel = "claude-sonnet-4.6";
     let isComplete = false;
 
     // Handle actual client disconnect (response stream closed)
@@ -260,19 +260,19 @@ export function handleModels(_req: Request, res: Response): void {
     object: "list",
     data: [
       {
-        id: "claude-opus-4",
+        id: "claude-opus-4.8",
         object: "model",
         owned_by: "anthropic",
         created: Math.floor(Date.now() / 1000),
       },
       {
-        id: "claude-sonnet-4",
+        id: "claude-sonnet-4.6",
         object: "model",
         owned_by: "anthropic",
         created: Math.floor(Date.now() / 1000),
       },
       {
-        id: "claude-haiku-4",
+        id: "claude-haiku-4.5",
         object: "model",
         owned_by: "anthropic",
         created: Math.floor(Date.now() / 1000),

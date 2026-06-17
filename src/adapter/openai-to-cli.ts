@@ -27,7 +27,16 @@ interface CliImageContent {
   };
 }
 
-type CliContentBlock = CliTextContent | CliImageContent;
+interface CliDocumentContent {
+  type: "document";
+  source: {
+    type: "base64";
+    media_type: "application/pdf";
+    data: string;
+  };
+}
+
+type CliContentBlock = CliTextContent | CliImageContent | CliDocumentContent;
 
 /**
  * NDJSON message format for Claude CLI --input-format stream-json
@@ -52,14 +61,23 @@ export interface CliInput {
 }
 
 const MODEL_MAP: Record<string, ClaudeModel> = {
-  // Direct model names
+  // Direct model names (current)
+  "claude-opus-4.8": "opus",
+  "claude-sonnet-4.6": "sonnet",
+  "claude-haiku-4.5": "haiku",
+  // Legacy model names (backwards compat)
+  "claude-opus-4.6": "opus",
+  "claude-haiku-4": "haiku",
   "claude-opus-4": "opus",
   "claude-sonnet-4": "sonnet",
-  "claude-haiku-4": "haiku",
   // With provider prefix
+  "claude-code-cli/claude-opus-4.8": "opus",
+  "claude-code-cli/claude-sonnet-4.6": "sonnet",
+  "claude-code-cli/claude-haiku-4.5": "haiku",
+  "claude-code-cli/claude-opus-4.6": "opus",
+  "claude-code-cli/claude-haiku-4": "haiku",
   "claude-code-cli/claude-opus-4": "opus",
   "claude-code-cli/claude-sonnet-4": "sonnet",
-  "claude-code-cli/claude-haiku-4": "haiku",
   // Aliases
   "opus": "opus",
   "sonnet": "sonnet",
@@ -81,9 +99,9 @@ export function extractModel(model: string): ClaudeModel {
 }
 
 /**
- * Check if any message in the request contains images
+ * Check if any message in the request contains multimodal content (images or PDFs)
  */
-function requestHasImages(messages: OpenAIChatRequest["messages"]): boolean {
+function requestHasMultimodal(messages: OpenAIChatRequest["messages"]): boolean {
   return messages.some((msg) => {
     if (typeof msg.content === "string") return false;
     return msg.content.some((part) => part.type === "image_url");
@@ -104,19 +122,32 @@ function extractText(content: string | OpenAIChatContentPart[]): string {
 }
 
 /**
- * Convert an OpenAI image_url to a Claude CLI base64 image block.
- * Handles data URIs (data:image/png;base64,...) and passes through the data.
+ * Convert an OpenAI image_url to a Claude CLI base64 content block.
+ * Handles data URIs for both images (data:image/png;base64,...) and PDFs (data:application/pdf;base64,...).
  */
-function convertImagePart(part: OpenAIChatContentPart): CliImageContent | null {
+function convertMediaPart(part: OpenAIChatContentPart): CliContentBlock | null {
   if (part.type !== "image_url" || !part.image_url) return null;
 
   const url = part.image_url.url;
 
-  // Parse data URI: data:image/png;base64,iVBOR...
+  // Check for PDF data URI first: data:application/pdf;base64,...
+  const pdfMatch = url.match(/^data:application\/pdf;base64,(.+)$/i);
+  if (pdfMatch) {
+    return {
+      type: "document",
+      source: {
+        type: "base64",
+        media_type: "application/pdf",
+        data: pdfMatch[1],
+      },
+    };
+  }
+
+  // Parse image data URI: data:image/png;base64,iVBOR...
   const match = url.match(/^data:(image\/[a-z+]+);base64,(.+)$/i);
   if (!match) {
     // Non-data-URI images (http URLs) are not supported by CLI
-    console.error("[openai-to-cli] Skipping non-data-URI image:", url.slice(0, 60));
+    console.error("[openai-to-cli] Skipping non-data-URI media:", url.slice(0, 60));
     return null;
   }
 
@@ -143,8 +174,8 @@ function convertContentParts(content: string | OpenAIChatContentPart[]): CliCont
     if (part.type === "text" && part.text) {
       blocks.push({ type: "text", text: part.text });
     } else if (part.type === "image_url") {
-      const img = convertImagePart(part);
-      if (img) blocks.push(img);
+      const media = convertMediaPart(part);
+      if (media) blocks.push(media);
     }
   }
   return blocks;
@@ -222,7 +253,7 @@ export function messagesToPrompt(messages: OpenAIChatRequest["messages"]): strin
  * Automatically chooses stream-json mode when images are present.
  */
 export function openaiToCli(request: OpenAIChatRequest): CliInput {
-  const hasImages = requestHasImages(request.messages);
+  const hasImages = requestHasMultimodal(request.messages);
 
   return {
     prompt: messagesToPrompt(request.messages),
