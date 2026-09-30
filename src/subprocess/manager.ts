@@ -23,6 +23,8 @@ export interface SubprocessOptions {
   sessionId?: string;
   cwd?: string;
   timeout?: number;
+  /** Appended to the base system prompt — carries the tool-calling contract. */
+  systemPromptSuffix?: string;
 }
 
 export interface SubprocessEvents {
@@ -34,12 +36,25 @@ export interface SubprocessEvents {
   raw: (line: string) => void;
 }
 
-const DEFAULT_TIMEOUT = 300000; // 5 minutes
+// A wall-clock timer armed at spawn killed responses that were still actively
+// streaming (observed: ~400 bytes/chunk flowing continuously, then SIGTERM at
+// exactly 300000ms and the user lost the entire answer). Long research answers
+// legitimately exceed 5 minutes. What actually indicates a stuck process is
+// SILENCE, so the primary timer is now an IDLE timer rearmed on every chunk,
+// with a generous absolute ceiling as the backstop.
+const BASE_SYSTEM_PROMPT =
+  "You are a helpful assistant. Follow the user's instructions precisely. " +
+  "When asked to output JSON, output ONLY raw JSON without markdown code fences.";
+
+const DEFAULT_IDLE_TIMEOUT = Number(process.env.CLAUDE_PROXY_IDLE_TIMEOUT || 180000);   // 3 min with no output
+const DEFAULT_MAX_TIMEOUT = Number(process.env.CLAUDE_PROXY_MAX_TIMEOUT || 1800000);    // 30 min absolute
 
 export class ClaudeSubprocess extends EventEmitter {
   private process: ChildProcess | null = null;
   private buffer: string = "";
   private timeoutId: NodeJS.Timeout | null = null;
+  private hardTimeoutId: NodeJS.Timeout | null = null;
+  private idleMs: number = DEFAULT_IDLE_TIMEOUT;
   private isKilled: boolean = false;
 
   /**
@@ -55,7 +70,8 @@ export class ClaudeSubprocess extends EventEmitter {
   ): Promise<void> {
     const useStreamInput = !!options.stdinMessages?.length;
     const args = this.buildArgs(useStreamInput ? null : prompt, options, useStreamInput);
-    const timeout = options.timeout || DEFAULT_TIMEOUT;
+    const idleMs = options.timeout || DEFAULT_IDLE_TIMEOUT;
+    this.idleMs = idleMs;
 
     return new Promise((resolve, reject) => {
       try {
@@ -66,14 +82,24 @@ export class ClaudeSubprocess extends EventEmitter {
           stdio: ["pipe", "pipe", "pipe"],
         });
 
-        // Set timeout
-        this.timeoutId = setTimeout(() => {
+        // Idle timer: rearmed on every chunk of stdout (see stdout handler).
+        this.armIdle();
+
+        // Absolute ceiling, so a pathological run cannot hang forever.
+        this.hardTimeoutId = setTimeout(() => {
           if (!this.isKilled) {
             this.isKilled = true;
             this.process?.kill("SIGTERM");
-            this.emit("error", new Error(`Request timed out after ${timeout}ms`));
+            this.emit(
+              "error",
+              new Error(
+                `Request exceeded the maximum duration of ${Math.round(
+                  DEFAULT_MAX_TIMEOUT / 60000
+                )} minutes.`
+              )
+            );
           }
-        }, timeout);
+        }, DEFAULT_MAX_TIMEOUT);
 
         // Handle spawn errors (e.g., claude not found)
         this.process.on("error", (err) => {
@@ -106,6 +132,7 @@ export class ClaudeSubprocess extends EventEmitter {
         this.process.stdout?.on("data", (chunk: Buffer) => {
           const data = chunk.toString();
           console.error(`[Subprocess] Received ${data.length} bytes of stdout`);
+          this.armIdle(); // output means it is alive — do not kill a streaming response
           this.buffer += data;
           this.processBuffer();
         });
@@ -159,7 +186,8 @@ export class ClaudeSubprocess extends EventEmitter {
       "--tools", "", // Disable all tools — act as a plain chat model
       "--disable-slash-commands", // Disable skills
       "--setting-sources", "", // Don't load any settings files (CLAUDE.md etc.)
-      "--system-prompt", "You are a helpful assistant. Follow the user's instructions precisely. When asked to output JSON, output ONLY raw JSON without markdown code fences.",
+      "--system-prompt",
+      BASE_SYSTEM_PROMPT + (options.systemPromptSuffix || ""),
     ];
 
     if (streamInput) {
@@ -208,10 +236,34 @@ export class ClaudeSubprocess extends EventEmitter {
   /**
    * Clear the timeout timer
    */
+  private armIdle(): void {
+    if (this.timeoutId) clearTimeout(this.timeoutId);
+    if (this.isKilled) return;
+    this.timeoutId = setTimeout(() => {
+      if (!this.isKilled) {
+        this.isKilled = true;
+        this.process?.kill("SIGTERM");
+        this.emit(
+          "error",
+          new Error(
+            `Request stalled: no output for ${Math.round(this.idleMs / 1000)}s.`
+          )
+        );
+      }
+    }, this.idleMs);
+  }
+
+  /**
+   * Clear the timeout timers
+   */
   private clearTimeout(): void {
     if (this.timeoutId) {
       clearTimeout(this.timeoutId);
       this.timeoutId = null;
+    }
+    if (this.hardTimeoutId) {
+      clearTimeout(this.hardTimeoutId);
+      this.hardTimeoutId = null;
     }
   }
 

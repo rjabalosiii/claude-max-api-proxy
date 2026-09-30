@@ -4,6 +4,7 @@
 
 import type { ClaudeCliAssistant, ClaudeCliResult } from "../types/claude-cli.js";
 import type { OpenAIChatResponse, OpenAIChatChunk } from "../types/openai.js";
+import { parseToolCalls } from "./tool-protocol.js";
 
 /**
  * Extract JSON content from model response.
@@ -12,6 +13,7 @@ import type { OpenAIChatResponse, OpenAIChatChunk } from "../types/openai.js";
  * finding a raw JSON object/array in the text.
  */
 function stripCodeFences(text: string): string {
+  if (!text) return "";
   // Find all code fence blocks and take the last one (most likely the JSON)
   const fenceMatches = [...text.matchAll(/```(?:\w*)\n([\s\S]*?)\n```/g)];
   if (fenceMatches.length > 0) {
@@ -73,7 +75,11 @@ export function cliToOpenaiChunk(
 /**
  * Create a final "done" chunk for streaming
  */
-export function createDoneChunk(requestId: string, model: string): OpenAIChatChunk {
+export function createDoneChunk(
+  requestId: string,
+  model: string,
+  finishReason: "stop" | "tool_calls" = "stop"
+): OpenAIChatChunk {
   return {
     id: `chatcmpl-${requestId}`,
     object: "chat.completion.chunk",
@@ -83,7 +89,7 @@ export function createDoneChunk(requestId: string, model: string): OpenAIChatChu
       {
         index: 0,
         delta: {},
-        finish_reason: "stop",
+        finish_reason: finishReason,
       },
     ],
   };
@@ -94,28 +100,24 @@ export function createDoneChunk(requestId: string, model: string): OpenAIChatChu
  */
 export function cliResultToOpenai(
   result: ClaudeCliResult,
-  requestId: string
+  requestId: string,
+  toolsEnabled: boolean = false
 ): OpenAIChatResponse {
-  // Get model from modelUsage or default
-  const modelName = result.modelUsage
-    ? Object.keys(result.modelUsage)[0]
-    : "claude-sonnet-4";
+  // When the CLI exits non-zero it still emits a result, but `modelUsage` can be
+  // an EMPTY object — which is truthy, so `Object.keys({})[0]` was `undefined`
+  // and normalizeModelName threw. That throw happened inside a subprocess "close"
+  // handler, so it was an uncaught exception that killed the WHOLE proxy, taking
+  // every concurrent chat down with it. Observed 5 times on 2026-09-24/25; the
+  // user saw "Open WebUI: Server Connection Error" 5 times.
+  const modelName =
+    (result.modelUsage && Object.keys(result.modelUsage)[0]) || "claude-sonnet-4";
 
   return {
     id: `chatcmpl-${requestId}`,
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
     model: normalizeModelName(modelName),
-    choices: [
-      {
-        index: 0,
-        message: {
-          role: "assistant",
-          content: stripCodeFences(result.result),
-        },
-        finish_reason: "stop",
-      },
-    ],
+    choices: [makeChoice(result.result, toolsEnabled)],
     usage: {
       prompt_tokens: result.usage?.input_tokens || 0,
       completion_tokens: result.usage?.output_tokens || 0,
@@ -126,12 +128,55 @@ export function cliResultToOpenai(
 }
 
 /**
+ * Build the response choice.
+ *
+ * When tools are in play the RAW text must be parsed first: `stripCodeFences`
+ * hunts for a bare JSON object and would happily return the tool call's own
+ * arguments with the sentinel tags stripped off, making the call undetectable.
+ */
+function makeChoice(
+  raw: string | undefined | null,
+  toolsEnabled: boolean
+): OpenAIChatResponse["choices"][number] {
+  raw = raw ?? "";
+  if (toolsEnabled) {
+    const { toolCalls, content } = parseToolCalls(raw ?? "");
+    if (toolCalls.length) {
+      return {
+        index: 0,
+        message: {
+          role: "assistant",
+          content: content || null,
+          tool_calls: toolCalls,
+        },
+        finish_reason: "tool_calls",
+      };
+    }
+    return {
+      index: 0,
+      message: { role: "assistant", content: content },
+      finish_reason: "stop",
+    };
+  }
+  return {
+    index: 0,
+    message: { role: "assistant", content: stripCodeFences(raw) },
+    finish_reason: "stop",
+  };
+}
+
+/**
  * Normalize Claude model names to a consistent format
  * e.g., "claude-sonnet-4-5-20250929" -> "claude-sonnet-4"
  */
-function normalizeModelName(model: string): string {
-  if (model.includes("opus")) return "claude-opus-4";
-  if (model.includes("sonnet")) return "claude-sonnet-4";
-  if (model.includes("haiku")) return "claude-haiku-4";
+// Report the TIER, never a version. The CLI resolves `opus`/`sonnet`/`haiku` to
+// whatever is current (today: claude-opus-5-5 / claude-sonnet-5), so any number
+// baked in here is a number that will lie -- this returned "claude-opus-4" while
+// actually serving Opus 5.5. The real model is still in the proxy logs.
+function normalizeModelName(model?: string | null): string {
+  if (!model) return "claude-sonnet";
+  if (model.includes("opus")) return "claude-opus";
+  if (model.includes("sonnet")) return "claude-sonnet";
+  if (model.includes("haiku")) return "claude-haiku";
   return model;
 }

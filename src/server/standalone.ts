@@ -8,7 +8,7 @@
  *   node dist/server/standalone.js [port]
  */
 
-import { startServer, stopServer } from "./index.js";
+import { startServer, stopServer, inFlightCount } from "./index.js";
 import { verifyClaude, verifyAuth } from "../subprocess/manager.js";
 
 const DEFAULT_PORT = 3456;
@@ -56,15 +56,44 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Handle graceful shutdown
-  const shutdown = async () => {
-    console.log("\nShutting down...");
-    await stopServer();
+  // Handle graceful shutdown.
+  //
+  // launchd sends SIGTERM and then SIGKILLs after ExitTimeOut, so the plist must
+  // allow at least CLAUDE_PROXY_DRAIN_MS or the drain is pointless. A second
+  // signal is treated as "I mean it" and exits immediately.
+  let shuttingDown = false;
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) {
+      console.error(`\n[${signal}] Second signal — exiting now.`);
+      process.exit(0);
+    }
+    shuttingDown = true;
+    console.error(
+      `\n[${signal}] Shutting down; ${inFlightCount()} request(s) in flight.`
+    );
+    try {
+      // launchd SIGKILLs 60s after SIGTERM and clamps ExitTimeOut to 60
+      // regardless of the plist, so this budget must fit inside it. For a real
+      // drain of long requests, use POST /admin/drain instead.
+      await stopServer(Number(process.env.CLAUDE_PROXY_SIGTERM_DRAIN_MS || 55000));
+    } catch (err) {
+      console.error("[Shutdown] Error while draining:", err);
+    }
     process.exit(0);
   };
 
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  // Last resort. A single malformed CLI result used to crash the whole proxy and
+  // drop every in-flight chat (see cli-to-openai normalizeModelName). Staying up
+  // with one failed request beats taking everyone down.
+  process.on("uncaughtException", (err) => {
+    console.error("[FATAL-GUARD] Uncaught exception, staying up:", err);
+  });
+  process.on("unhandledRejection", (reason) => {
+    console.error("[FATAL-GUARD] Unhandled rejection, staying up:", reason);
+  });
+
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
 }
 
 main().catch((err) => {

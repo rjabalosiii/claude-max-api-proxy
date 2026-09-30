@@ -6,7 +6,12 @@
  * - Stream-JSON: NDJSON piped to stdin with full multimodal support (images)
  */
 
-import type { OpenAIChatRequest, OpenAIChatContentPart } from "../types/openai.js";
+import type {
+  OpenAIChatRequest,
+  OpenAIChatContentPart,
+  OpenAIChatMessage,
+} from "../types/openai.js";
+import { OPEN_TAG, CLOSE_TAG } from "./tool-protocol.js";
 
 export type ClaudeModel = "opus" | "sonnet" | "haiku";
 
@@ -103,7 +108,7 @@ export function extractModel(model: string): ClaudeModel {
  */
 function requestHasMultimodal(messages: OpenAIChatRequest["messages"]): boolean {
   return messages.some((msg) => {
-    if (typeof msg.content === "string") return false;
+    if (msg.content == null || typeof msg.content === "string") return false;
     return msg.content.some((part) => part.type === "image_url");
   });
 }
@@ -111,7 +116,10 @@ function requestHasMultimodal(messages: OpenAIChatRequest["messages"]): boolean 
 /**
  * Extract text from content (string or array of content parts).
  */
-function extractText(content: string | OpenAIChatContentPart[]): string {
+function extractText(content: string | OpenAIChatContentPart[] | null): string {
+  if (content == null) {
+    return "";
+  }
   if (typeof content === "string") {
     return content;
   }
@@ -164,7 +172,10 @@ function convertMediaPart(part: OpenAIChatContentPart): CliContentBlock | null {
 /**
  * Convert OpenAI content parts to Claude CLI content blocks
  */
-function convertContentParts(content: string | OpenAIChatContentPart[]): CliContentBlock[] {
+function convertContentParts(content: string | OpenAIChatContentPart[] | null): CliContentBlock[] {
+  if (content == null) {
+    return [];
+  }
   if (typeof content === "string") {
     return [{ type: "text", text: content }];
   }
@@ -179,6 +190,44 @@ function convertContentParts(content: string | OpenAIChatContentPart[]): CliCont
     }
   }
   return blocks;
+}
+
+
+/**
+ * Render an assistant turn that called tools back into the transcript.
+ *
+ * The CLI has no notion of a tool call, so the previous turn is replayed in the
+ * same sentinel syntax the model was told to produce. Without this the model
+ * cannot see that it already called the tool and calls it again — the exact
+ * shape of the 256-iteration loop we are trying to avoid.
+ */
+function assistantTurnToText(msg: OpenAIChatMessage): string {
+  const parts: string[] = [];
+  const text = extractText(msg.content);
+  if (text) parts.push(text);
+  for (const tc of msg.tool_calls ?? []) {
+    parts.push(
+      `${OPEN_TAG}\n${JSON.stringify({
+        name: tc.function.name,
+        arguments: safeParseArgs(tc.function.arguments),
+      })}\n${CLOSE_TAG}`
+    );
+  }
+  return parts.join("\n");
+}
+
+function safeParseArgs(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+}
+
+/** Render a tool result turn. */
+function toolTurnToText(msg: OpenAIChatMessage): string {
+  const name = msg.name ? ` name="${msg.name}"` : "";
+  return `<tool_result${name}>\n${extractText(msg.content)}\n</tool_result>`;
 }
 
 /**
@@ -201,8 +250,12 @@ function messagesToStreamJson(messages: OpenAIChatRequest["messages"]): string[]
         break;
       }
       case "assistant": {
-        const text = extractText(msg.content);
+        const text = assistantTurnToText(msg);
         allBlocks.push({ type: "text", text: `<previous_response>\n${text}\n</previous_response>` });
+        break;
+      }
+      case "tool": {
+        allBlocks.push({ type: "text", text: toolTurnToText(msg) });
         break;
       }
       case "user": {
@@ -240,7 +293,10 @@ export function messagesToPrompt(messages: OpenAIChatRequest["messages"]): strin
         parts.push(text);
         break;
       case "assistant":
-        parts.push(`<previous_response>\n${text}\n</previous_response>\n`);
+        parts.push(`<previous_response>\n${assistantTurnToText(msg)}\n</previous_response>\n`);
+        break;
+      case "tool":
+        parts.push(`${toolTurnToText(msg)}\n`);
         break;
     }
   }

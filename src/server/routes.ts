@@ -13,6 +13,7 @@ import {
   createDoneChunk,
 } from "../adapter/cli-to-openai.js";
 import type { OpenAIChatRequest } from "../types/openai.js";
+import { buildToolInstructions, safeSplit, parseToolCalls } from "../adapter/tool-protocol.js";
 import type { ClaudeCliAssistant, ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
 
 /**
@@ -45,10 +46,28 @@ export async function handleChatCompletions(
     const cliInput = openaiToCli(body);
     const subprocess = new ClaudeSubprocess();
 
+    // The CLI runs with `--tools ""`, so tool calling is carried in the system
+    // prompt and translated back on the way out. See adapter/tool-protocol.ts.
+    const toolInstructions = buildToolInstructions(
+      body.tools ?? [],
+      body.tool_choice
+    );
+    const toolsEnabled = toolInstructions.length > 0;
+    if (toolsEnabled) {
+      console.error(
+        `[Tools] ${body.tools?.length} tool(s) offered: ` +
+          `${body.tools?.map((t) => t.function.name).join(", ")}`
+      );
+    }
+
     if (stream) {
-      await handleStreamingResponse(req, res, subprocess, cliInput, requestId);
+      await handleStreamingResponse(
+        req, res, subprocess, cliInput, requestId, toolInstructions, toolsEnabled
+      );
     } else {
-      await handleNonStreamingResponse(res, subprocess, cliInput, requestId);
+      await handleNonStreamingResponse(
+        res, subprocess, cliInput, requestId, toolInstructions, toolsEnabled
+      );
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
@@ -78,7 +97,9 @@ async function handleStreamingResponse(
   res: Response,
   subprocess: ClaudeSubprocess,
   cliInput: ReturnType<typeof openaiToCli>,
-  requestId: string
+  requestId: string,
+  toolInstructions: string,
+  toolsEnabled: boolean
 ): Promise<void> {
   // Set SSE headers
   res.setHeader("Content-Type", "text/event-stream");
@@ -97,6 +118,27 @@ async function handleStreamingResponse(
     let isFirst = true;
     let lastModel = "claude-sonnet-4.6";
     let isComplete = false;
+    // Tool mode: `holdBuf` withholds any suffix that might be the start of a
+    // `<tool_call>` tag, so the literal syntax never reaches the chat window one
+    // token at a time. `fullText` is what we parse once the model is done.
+    let holdBuf = "";
+    let fullText = "";
+
+    const writeContent = (text: string) => {
+      if (!text || res.writableEnded) return;
+      res.write(`data: ${JSON.stringify({
+        id: `chatcmpl-${requestId}`,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model: lastModel,
+        choices: [{
+          index: 0,
+          delta: { role: isFirst ? "assistant" : undefined, content: text },
+          finish_reason: null,
+        }],
+      })}\n\n`);
+      isFirst = false;
+    };
 
     // Handle actual client disconnect (response stream closed)
     res.on("close", () => {
@@ -110,24 +152,16 @@ async function handleStreamingResponse(
     // Handle streaming content deltas
     subprocess.on("content_delta", (event: ClaudeCliStreamEvent) => {
       const text = event.event.delta?.text || "";
-      if (text && !res.writableEnded) {
-        const chunk = {
-          id: `chatcmpl-${requestId}`,
-          object: "chat.completion.chunk",
-          created: Math.floor(Date.now() / 1000),
-          model: lastModel,
-          choices: [{
-            index: 0,
-            delta: {
-              role: isFirst ? "assistant" : undefined,
-              content: text,
-            },
-            finish_reason: null,
-          }],
-        };
-        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-        isFirst = false;
+      if (!text || res.writableEnded) return;
+      if (!toolsEnabled) {
+        writeContent(text);
+        return;
       }
+      fullText += text;
+      holdBuf += text;
+      const { emit, hold } = safeSplit(holdBuf);
+      holdBuf = hold;
+      writeContent(emit);
     });
 
     // Handle final assistant message (for model name)
@@ -135,11 +169,48 @@ async function handleStreamingResponse(
       lastModel = message.message.model;
     });
 
-    subprocess.on("result", (_result: ClaudeCliResult) => {
+    subprocess.on("result", (result: ClaudeCliResult) => {
       isComplete = true;
       if (!res.writableEnded) {
-        // Send final done chunk with finish_reason
-        const doneChunk = createDoneChunk(requestId, lastModel);
+        let finish: "stop" | "tool_calls" = "stop";
+        if (toolsEnabled) {
+          // Prefer the CLI's own final text: content_delta can be absent when the
+          // reply is short enough to arrive as a single assistant message.
+          const raw = fullText || result.result || "";
+          const { toolCalls } = parseToolCalls(raw);
+          if (toolCalls.length) {
+            finish = "tool_calls";
+            res.write(`data: ${JSON.stringify({
+              id: `chatcmpl-${requestId}`,
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model: lastModel,
+              choices: [{
+                index: 0,
+                delta: {
+                  role: isFirst ? "assistant" : undefined,
+                  tool_calls: toolCalls.map((tc, i) => ({
+                    index: i,
+                    id: tc.id,
+                    type: "function" as const,
+                    function: {
+                      name: tc.function.name,
+                      arguments: tc.function.arguments,
+                    },
+                  })),
+                },
+                finish_reason: null,
+              }],
+            })}\n\n`);
+            isFirst = false;
+          } else {
+            // No call after all — release whatever was held back.
+            writeContent(holdBuf);
+            if (!fullText && result.result) writeContent(result.result);
+          }
+          holdBuf = "";
+        }
+        const doneChunk = createDoneChunk(requestId, lastModel, finish);
         res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
         res.write("data: [DONE]\n\n");
         res.end();
@@ -179,6 +250,7 @@ async function handleStreamingResponse(
     subprocess.start(cliInput.prompt, {
       model: cliInput.model,
       sessionId: cliInput.sessionId,
+      systemPromptSuffix: toolInstructions,
       stdinMessages: cliInput.hasImages ? cliInput.stdinMessages : undefined,
     }).catch((err) => {
       console.error("[Streaming] Subprocess start error:", err);
@@ -194,7 +266,9 @@ async function handleNonStreamingResponse(
   res: Response,
   subprocess: ClaudeSubprocess,
   cliInput: ReturnType<typeof openaiToCli>,
-  requestId: string
+  requestId: string,
+  toolInstructions: string,
+  toolsEnabled: boolean
 ): Promise<void> {
   return new Promise((resolve) => {
     let finalResult: ClaudeCliResult | null = null;
@@ -217,7 +291,22 @@ async function handleNonStreamingResponse(
 
     subprocess.on("close", (code: number | null) => {
       if (finalResult) {
-        res.json(cliResultToOpenai(finalResult, requestId));
+        // Anything thrown here escapes into an EventEmitter callback and becomes
+        // an uncaught exception that kills the process for every concurrent user.
+        try {
+          res.json(cliResultToOpenai(finalResult, requestId, toolsEnabled));
+        } catch (err) {
+          console.error("[NonStreaming] Failed to convert CLI result:", err);
+          if (!res.headersSent) {
+            res.status(502).json({
+              error: {
+                message: "The model returned a response this proxy could not parse.",
+                type: "server_error",
+                code: "bad_cli_result",
+              },
+            });
+          }
+        }
       } else if (!res.headersSent) {
         res.status(500).json({
           error: {
@@ -235,6 +324,7 @@ async function handleNonStreamingResponse(
       .start(cliInput.prompt, {
         model: cliInput.model,
         sessionId: cliInput.sessionId,
+        systemPromptSuffix: toolInstructions,
         stdinMessages: cliInput.hasImages ? cliInput.stdinMessages : undefined,
       })
       .catch((error) => {
@@ -278,6 +368,31 @@ export function handleModels(_req: Request, res: Response): void {
         created: Math.floor(Date.now() / 1000),
       },
     ],
+  });
+}
+
+/**
+ * Handle POST /admin/drain
+ *
+ * launchd hard-clamps ExitTimeOut to 60s regardless of what the plist asks for,
+ * so a SIGTERM can never protect a ten-minute deck build. Instead the process
+ * drains and exits ON ITS OWN here, and launchd's KeepAlive restarts it. That
+ * makes the drain budget ours, not launchd's.
+ *
+ * The listener binds 127.0.0.1 only, so this is not remotely reachable.
+ */
+export function handleDrain(_req: Request, res: Response): void {
+  // Reply BEFORE draining: this request is itself counted as in-flight, so
+  // waiting for it to finish inside the drain would deadlock until the budget
+  // expired.
+  res.status(202).json({ status: "draining" });
+  res.on("finish", () => {
+    setImmediate(async () => {
+      const { stopServer } = await import("./index.js");
+      await stopServer(Number(process.env.CLAUDE_PROXY_DRAIN_MS || 600000));
+      console.error("[Drain] Exiting; launchd KeepAlive will restart.");
+      process.exit(0);
+    });
   });
 }
 
