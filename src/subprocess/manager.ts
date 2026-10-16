@@ -186,6 +186,10 @@ export class ClaudeSubprocess extends EventEmitter {
       "--tools", "", // Disable all tools — act as a plain chat model
       "--disable-slash-commands", // Disable skills
       "--setting-sources", "", // Don't load any settings files (CLAUDE.md etc.)
+      // Load NO MCP servers. Without this the CLI still attaches the account's claude.ai
+      // connectors (e.g. Claude Docs create/update/delete) even with --tools "", and callers
+      // send untrusted content (uploaded documents) that could try to steer the model into them.
+      "--strict-mcp-config",
       "--system-prompt",
       BASE_SYSTEM_PROMPT + (options.systemPromptSuffix || ""),
     ];
