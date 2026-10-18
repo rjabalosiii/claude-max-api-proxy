@@ -15,6 +15,9 @@ import {
 import type { OpenAIChatRequest } from "../types/openai.js";
 import { buildToolInstructions, safeSplit, parseToolCalls } from "../adapter/tool-protocol.js";
 import type { ClaudeCliAssistant, ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
+import { startUsage, usageContext } from "./usage-log.js";
+
+type UsageTracker = ReturnType<typeof startUsage>;
 
 /**
  * Handle POST /v1/chat/completions
@@ -53,6 +56,7 @@ export async function handleChatCompletions(
       body.tool_choice
     );
     const toolsEnabled = toolInstructions.length > 0;
+    const usage = startUsage(usageContext(req, requestId, cliInput.model));
     if (toolsEnabled) {
       console.error(
         `[Tools] ${body.tools?.length} tool(s) offered: ` +
@@ -62,11 +66,11 @@ export async function handleChatCompletions(
 
     if (stream) {
       await handleStreamingResponse(
-        req, res, subprocess, cliInput, requestId, toolInstructions, toolsEnabled
+        req, res, subprocess, cliInput, requestId, toolInstructions, toolsEnabled, usage
       );
     } else {
       await handleNonStreamingResponse(
-        res, subprocess, cliInput, requestId, toolInstructions, toolsEnabled
+        res, subprocess, cliInput, requestId, toolInstructions, toolsEnabled, usage
       );
     }
   } catch (error) {
@@ -99,7 +103,8 @@ async function handleStreamingResponse(
   cliInput: ReturnType<typeof openaiToCli>,
   requestId: string,
   toolInstructions: string,
-  toolsEnabled: boolean
+  toolsEnabled: boolean,
+  usage: UsageTracker
 ): Promise<void> {
   // Set SSE headers
   res.setHeader("Content-Type", "text/event-stream");
@@ -145,6 +150,7 @@ async function handleStreamingResponse(
       if (!isComplete) {
         // Client disconnected before response completed - kill subprocess
         subprocess.kill();
+        usage.finish(null, "client_closed");
       }
       resolve();
     });
@@ -171,6 +177,7 @@ async function handleStreamingResponse(
 
     subprocess.on("result", (result: ClaudeCliResult) => {
       isComplete = true;
+      usage.finish(result, result.is_error ? "error" : "ok");
       if (!res.writableEnded) {
         let finish: "stop" | "tool_calls" = "stop";
         if (toolsEnabled) {
@@ -220,6 +227,7 @@ async function handleStreamingResponse(
 
     subprocess.on("error", (error: Error) => {
       console.error("[Streaming] Error:", error.message);
+      usage.finish(null, "error");
       if (!res.writableEnded) {
         res.write(
           `data: ${JSON.stringify({
@@ -233,6 +241,7 @@ async function handleStreamingResponse(
 
     subprocess.on("close", (code: number | null) => {
       // Subprocess exited - ensure response is closed
+      if (!isComplete) usage.finish(null, "no_result");
       if (!res.writableEnded) {
         if (code !== 0 && !isComplete) {
           // Abnormal exit without result - send error
@@ -254,6 +263,7 @@ async function handleStreamingResponse(
       stdinMessages: cliInput.hasImages ? cliInput.stdinMessages : undefined,
     }).catch((err) => {
       console.error("[Streaming] Subprocess start error:", err);
+      usage.finish(null, "error");
       reject(err);
     });
   });
@@ -268,7 +278,8 @@ async function handleNonStreamingResponse(
   cliInput: ReturnType<typeof openaiToCli>,
   requestId: string,
   toolInstructions: string,
-  toolsEnabled: boolean
+  toolsEnabled: boolean,
+  usage: UsageTracker
 ): Promise<void> {
   return new Promise((resolve) => {
     let finalResult: ClaudeCliResult | null = null;
@@ -279,6 +290,7 @@ async function handleNonStreamingResponse(
 
     subprocess.on("error", (error: Error) => {
       console.error("[NonStreaming] Error:", error.message);
+      usage.finish(null, "error");
       res.status(500).json({
         error: {
           message: error.message,
@@ -290,6 +302,8 @@ async function handleNonStreamingResponse(
     });
 
     subprocess.on("close", (code: number | null) => {
+      const r: ClaudeCliResult | null = finalResult;
+      usage.finish(r, r ? (r.is_error ? "error" : "ok") : "no_result");
       if (finalResult) {
         // Anything thrown here escapes into an EventEmitter callback and becomes
         // an uncaught exception that kills the process for every concurrent user.
@@ -328,6 +342,7 @@ async function handleNonStreamingResponse(
         stdinMessages: cliInput.hasImages ? cliInput.stdinMessages : undefined,
       })
       .catch((error) => {
+        usage.finish(null, "error");
         res.status(500).json({
           error: {
             message: error.message,
